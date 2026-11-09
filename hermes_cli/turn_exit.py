@@ -11,6 +11,10 @@ TRANSIENT_PROVIDER_REASONS = frozenset({
 TERMINAL_PROVIDER_REASONS = frozenset({
     "auth", "auth_permanent", "model_not_found", "ssl_cert_verification", "upstream_blocked",
 })
+# ``failure_reason`` stamped when the model's reply was cut off (output cap, repetition stop, stream
+# closed mid tool call) and the incomplete action was not run. A Kanban worker exits its own code, so
+# the dispatcher can retry it on a bounded budget instead of charging the card a plain failure.
+TRUNCATED_REPLY_REASON = "truncated"
 
 
 def turn_exit_code(
@@ -39,6 +43,9 @@ def turn_exit_code(
         if reason in terminal_reasons:
             from hermes_cli.kanban_db import KANBAN_TERMINAL_PROVIDER_EXIT_CODE
             return KANBAN_TERMINAL_PROVIDER_EXIT_CODE
+        if reason == TRUNCATED_REPLY_REASON:
+            from hermes_cli.kanban_db_dispatch_streaks import KANBAN_TRUNCATED_REPLY_EXIT_CODE
+            return KANBAN_TRUNCATED_REPLY_EXIT_CODE
     return 1
 
 

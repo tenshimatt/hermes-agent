@@ -251,6 +251,9 @@ def _exit_code_kind(code: int) -> tuple[str, int]:
         return ("rate_limited", code)
     if code == _kb.KANBAN_TERMINAL_PROVIDER_EXIT_CODE:
         return ("terminal_provider", code)
+    from hermes_cli.kanban_db_dispatch_streaks import KANBAN_TRUNCATED_REPLY_EXIT_CODE
+    if code == KANBAN_TRUNCATED_REPLY_EXIT_CODE:
+        return ("truncated_reply", code)
     return ("nonzero_exit", code)
 
 
@@ -930,44 +933,10 @@ def _error_fingerprint(error_text: str) -> str:
 
 # ~96% of "clean exit without a terminal tool call" tasks complete on a later
 # run, so a protocol violation gets a bounded retry before the breaker trips.
-# The budget is a violation-only STREAK (``_protocol_violation_streak``),
+# The budget is a violation-only STREAK (``protocol_violation_streak``),
 # independent of ``consecutive_failures``: other failure kinds neither consume
 # nor extend it. Per-task ``max_retries`` overrides it.
 _PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
-
-# Closed runs to walk when counting the streak; it trips at a handful anyway.
-_PROTOCOL_VIOLATION_SCAN_LIMIT = 50
-
-
-def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
-    """Count the task's trailing run of clean-exit protocol violations.
-
-    Walks closed runs newest-first (including the one ``detect_crashed_workers``
-    just closed). ``rate_limited`` runs are neutral and skipped (a quota wall
-    says nothing about the task); any other closed run breaks the streak, so
-    the budget counts ONLY protocol violations. Violations are recognized by the
-    ``protocol_violation`` run-metadata marker, with the error text as fallback
-    for runs recorded before the marker existed.
-    """
-    streak = 0
-    rows = conn.execute(
-        "SELECT outcome, error, metadata FROM task_runs "
-        "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY id DESC LIMIT ?",
-        (task_id, _PROTOCOL_VIOLATION_SCAN_LIMIT),
-    ).fetchall()
-    for row in rows:
-        outcome = row["outcome"] or ""
-        if outcome == "rate_limited":
-            continue
-        head = (row["error"] or "").partition(WORKER_OUTPUT_SEP)[0]  # never the worker's own words
-        if outcome == "crashed" and (
-                _kb._json_dict(row["metadata"]).get("protocol_violation") or "protocol violation" in head):
-            streak += 1
-            continue
-        break
-    return streak
-
 
 WORKER_OUTPUT_SEP = " Worker's last output: "  # dead-worker error text: our words, then the worker's
 _PROTOCOL_VIOLATION_ERROR = (
@@ -1049,6 +1018,7 @@ class _DeadWorker:
     terminal_provider: bool = False
     """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
     credential/model — trips the breaker on this first occurrence."""
+    truncated_reply: bool = False  # exit 76: booked a crash, counted on its own bounded streak
 
     @property
     def run_outcome(self) -> str:
@@ -1134,6 +1104,9 @@ def _classify_dead_worker_exit(
             {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code, "terminal_provider": True},
             terminal_provider=True,
         )
+    if kind == "truncated_reply":
+        from hermes_cli.kanban_db_dispatch_streaks import dead_worker
+        return dead_worker(pid, claimer, code)
     if kind == "nonzero_exit":
         error_text = f"pid {pid} exited with code {code}"
     elif kind == "signaled":
@@ -1221,11 +1194,11 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 "outcome": dead.run_outcome,
                 "retry_status": retry_status,
             })
-            if dead.rate_limited or dead.protocol_violation:
+            if dead.rate_limited or dead.protocol_violation or dead.truncated_reply:
                 # Stamp last_failure_error WITHOUT touching ``consecutive_failures``:
                 # a rate-limited requeue must show ``check_respawn_guard`` a quota
-                # blocker; a below-budget protocol violation never reaches
-                # ``_record_task_failure`` (which stamps this column), yet the
+                # blocker; a below-budget protocol violation or truncated reply never
+                # reaches ``_record_task_failure`` (which stamps this column), yet the
                 # board UI and retry worker need the corrective message.
                 conn.execute(
                     "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
@@ -1256,7 +1229,8 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     for tid, pid, claimer, dead in crash_details:
         error_text = dead.error_text
         if dead.protocol_violation:
-            streak = _protocol_violation_streak(conn, tid)
+            from hermes_cli.kanban_db_dispatch_streaks import protocol_violation_streak
+            streak = protocol_violation_streak(conn, tid)
             trow = conn.execute("SELECT max_retries FROM tasks WHERE id = ?", (tid,)).fetchone()
             if trow is None:
                 continue  # task deleted mid-loop
@@ -1285,6 +1259,9 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                     "protocol_violation_limit": violation_limit,
                 },
             )
+        elif dead.truncated_reply:
+            from hermes_cli.kanban_db_dispatch_streaks import account_truncated_reply
+            tripped = account_truncated_reply(conn, tid, pid, claimer, dead)
         elif dead.terminal_provider:
             # A retry cannot heal a revoked credential or a missing model, so
             # the whole ``failure_limit`` budget would be spent on identical
