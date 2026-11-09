@@ -10,8 +10,10 @@ about the work and get a bounded streak of their own, counted over the card's cl
   ``consecutive_failures``: two cut-off replies parked a card at ``failure_limit`` though nothing
   about the work was shown wrong. It still books ``crashed`` with the worker's real message (the card
   says why), but ``TRUNCATED_REPLY_FAILURE_LIMIT`` in a row park it, sticky, as a protocol-violation
-  streak does, and a per-task ``max_retries`` overrides it. Any other closed run breaks the streak, so
-  a card cannot loop on truncation, and a different crash still spends the plain budget.
+  streak does, and a per-task ``max_retries`` overrides it. The truncation streak also counts
+  protocol-violation runs that sit in the same trailing run, so a card that alternates the two
+  (both spend no plain budget) still parks after ``TRUNCATED_REPLY_FAILURE_LIMIT`` of them. Any
+  other closed run breaks the streak, and a different crash still spends the plain budget.
 """
 
 from __future__ import annotations
@@ -63,16 +65,25 @@ def protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
 
 
 def truncated_reply_streak(conn: sqlite3.Connection, task_id: str) -> int:
-    """The task's trailing run of truncated-reply crashes, counting the run just closed."""
+    """The task's trailing run of truncated-reply crashes, counting the run just closed.
+
+    Protocol-violation crashes inside the run count too: neither kind charges
+    ``consecutive_failures``, so each streak counted alone is reset by the other and a card
+    alternating the two would never park. Any other closed run breaks the streak.
+    """
     from hermes_cli import kanban_db as _kb
+    from hermes_cli.kanban_db_dispatch import WORKER_OUTPUT_SEP
     streak = 0
     rows = conn.execute(
-        "SELECT outcome, metadata FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
+        "SELECT outcome, error, metadata FROM task_runs WHERE task_id = ? AND ended_at IS NOT NULL "
         "ORDER BY id DESC LIMIT ?", (task_id, _SCAN_LIMIT)).fetchall()
     for row in rows:
         if row["outcome"] == "rate_limited":
             continue
-        if row["outcome"] == "crashed" and _kb._json_dict(row["metadata"]).get("truncated_reply"):
+        meta = _kb._json_dict(row["metadata"])
+        head = (row["error"] or "").partition(WORKER_OUTPUT_SEP)[0]
+        if row["outcome"] == "crashed" and (
+                meta.get("truncated_reply") or meta.get("protocol_violation") or "protocol violation" in head):
             streak += 1
             continue
         break

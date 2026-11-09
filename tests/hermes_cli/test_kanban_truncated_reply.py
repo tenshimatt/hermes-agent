@@ -172,3 +172,20 @@ def test_a_plain_exit_one_is_unchanged(conn):
     assert _state(conn, tid)[:2] == ("ready", 1)
     _attempt(conn, tid, 1, output="boom")
     assert _state(conn, tid)[0] == "blocked"
+
+
+def test_truncation_alternating_with_a_protocol_violation_still_parks(conn):
+    """Neither kind charges ``consecutive_failures``; counted separately each reset the other forever."""
+    tid = kb.create_task(conn, title="t", assignee="w")
+    parked_after = None
+    for n in range(1, 11):
+        _attempt(conn, tid, KANBAN_TRUNCATED_REPLY_EXIT_CODE if n % 2 else 0, output="done")
+        if _state(conn, tid)[0] == "blocked":
+            parked_after = n
+            break
+    assert parked_after is not None, "10 alternating attempts and the card was never parked"
+    assert parked_after <= TRUNCATED_REPLY_FAILURE_LIMIT + 1
+    kinds = [json.loads(r["metadata"] or "{}") for r in conn.execute(
+        "SELECT metadata FROM task_runs WHERE task_id=? ORDER BY id", (tid,))]
+    assert any(m.get("protocol_violation") for m in kinds)   # the fixture really produced both kinds
+    assert any(m.get("truncated_reply") for m in kinds)
